@@ -1,0 +1,166 @@
+# The "Canary with analysis" strategy from Rollout Sim as an Argo Rollouts manifest.
+#
+# Same defaults as the simulator: weights of 1, 5, 25, and 50 percent, a 10
+# minute bake at each step, then an analysis that compares the canary with the
+# stable version over that bake window. After the last step Argo promotes to
+# 100%. Any failed check aborts the rollout, which sends all traffic back to
+# stable and scales the canary down.
+#
+# Assumes Prometheus scrapes http_requests_total and
+# http_request_duration_seconds_bucket with the rollouts_pod_template_hash
+# label, and an Istio VirtualService named "checkout" (any supported traffic
+# router works). Weights as low as 1% need a traffic router: with plain pod
+# ratios, 1% of 10 replicas is not possible.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: checkout
+  namespace: shop
+spec:
+  replicas: 10
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      containers:
+        - name: checkout
+          image: registry.example.com/shop/checkout:2.0.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+  strategy:
+    canary:
+      canaryService: checkout-canary
+      stableService: checkout-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: checkout
+            routes:
+              - primary
+      # Stable keeps its full size until the rollout finishes, so an abort is
+      # an instant traffic shift. This is the Argo default.
+      dynamicStableScale: false
+      abortScaleDownDelaySeconds: 30
+      steps:
+        - setWeight: 1
+        - pause: { duration: 10m }
+        - analysis: &compare
+            templates:
+              - templateName: canary-vs-stable
+            args:
+              - name: canary-hash
+                valueFrom:
+                  podTemplateHashValue: Latest
+              - name: stable-hash
+                valueFrom:
+                  podTemplateHashValue: Stable
+        - setWeight: 5
+        - pause: { duration: 10m }
+        - analysis: *compare
+        - setWeight: 25
+        - pause: { duration: 10m }
+        - analysis: *compare
+        - setWeight: 50
+        - pause: { duration: 10m }
+        - analysis: *compare
+        # After the last step Argo promotes the canary to 100% and makes it stable.
+        # The simulator also bakes and checks at 100%, comparing with v1's error
+        # rate from before the rollout, since stable has no traffic left by then.
+        # In Argo that check fits better as a post-promotion alert or a
+        # background analysis with absolute thresholds.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-vs-stable
+  namespace: shop
+spec:
+  args:
+    - name: canary-hash
+    - name: stable-hash
+    - name: window
+      value: 10m
+  metrics:
+    # One-sided two-proportion z-test on 5xx responses, canary vs stable.
+    # z above 2.326 is significant at the 1% level. Fewer than 200 canary
+    # requests is too little data to judge, so the check is inconclusive.
+    - name: error-rate-z
+      count: 1
+      failureLimit: 0
+      successCondition: result[0] < 2.326
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            (
+              (sum(increase(http_requests_total{app="checkout",code=~"5..",rollouts_pod_template_hash="{{args.canary-hash}}"}[{{args.window}}]))
+                / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash="{{args.canary-hash}}"}[{{args.window}}])))
+              -
+              (sum(increase(http_requests_total{app="checkout",code=~"5..",rollouts_pod_template_hash="{{args.stable-hash}}"}[{{args.window}}]))
+                / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash="{{args.stable-hash}}"}[{{args.window}}])))
+            )
+            /
+            sqrt(
+              (sum(increase(http_requests_total{app="checkout",code=~"5..",rollouts_pod_template_hash=~"{{args.canary-hash}}|{{args.stable-hash}}"}[{{args.window}}]))
+                / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash=~"{{args.canary-hash}}|{{args.stable-hash}}"}[{{args.window}}])))
+              *
+              (1 - sum(increase(http_requests_total{app="checkout",code=~"5..",rollouts_pod_template_hash=~"{{args.canary-hash}}|{{args.stable-hash}}"}[{{args.window}}]))
+                / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash=~"{{args.canary-hash}}|{{args.stable-hash}}"}[{{args.window}}])))
+              *
+              (1 / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash="{{args.canary-hash}}"}[{{args.window}}]))
+                + 1 / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash="{{args.stable-hash}}"}[{{args.window}}])))
+            )
+    # The simulator also requires the difference to be at least 0.5 points.
+    - name: error-rate-diff
+      count: 1
+      failureLimit: 0
+      successCondition: result[0] < 0.005
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(increase(http_requests_total{app="checkout",code=~"5..",rollouts_pod_template_hash="{{args.canary-hash}}"}[{{args.window}}]))
+              / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash="{{args.canary-hash}}"}[{{args.window}}]))
+            -
+            sum(increase(http_requests_total{app="checkout",code=~"5..",rollouts_pod_template_hash="{{args.stable-hash}}"}[{{args.window}}]))
+              / sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash="{{args.stable-hash}}"}[{{args.window}}]))
+    # p99 of the canary may be at most 20% above stable. The simulator uses a
+    # confidence bound on this ratio; a plain threshold plus a minimum request
+    # count is the usual production version.
+    - name: p99-ratio
+      count: 1
+      failureLimit: 0
+      successCondition: result[0] <= 1.2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{app="checkout",rollouts_pod_template_hash="{{args.canary-hash}}"}[{{args.window}}])))
+            /
+            histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{app="checkout",rollouts_pod_template_hash="{{args.stable-hash}}"}[{{args.window}}])))
+    # Too little canary traffic to judge: count as inconclusive, not as a pass.
+    - name: canary-requests
+      count: 1
+      inconclusiveLimit: 1
+      successCondition: result[0] >= 200
+      failureCondition: "false"
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(increase(http_requests_total{app="checkout",rollouts_pod_template_hash="{{args.canary-hash}}"}[{{args.window}}]))

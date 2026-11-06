@@ -1,0 +1,11 @@
+{
+  "name": "rollout-sim",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Compare deployment strategies when a release has a hidden bug: recreate, rolling, blue-green, canary, and canary with automated analysis.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  }
+}

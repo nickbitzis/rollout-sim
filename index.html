@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rollout Sim</title>
+  <meta name="description" content="Compare recreate, rolling, blue-green, canary, and canary with automated analysis when a release has a hidden bug. Every minute of traffic is simulated.">
+  <link rel="stylesheet" href="src/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>Rollout Sim</h1>
+      <p class="sub">One release with a hidden bug, five ways to ship it. How many users does each strategy expose, and what does it cost?</p>
+    </div>
+    <div class="actions">
+      <button type="button" id="share">Copy share link</button>
+      <button type="button" id="reset" class="ghost">Reset</button>
+    </div>
+  </header>
+
+  <section class="presets-wrap">
+    <div class="presets" id="scenarios" role="group" aria-label="Release scenario"></div>
+    <p class="hint" id="scenario-note"></p>
+  </section>
+
+  <main class="layout">
+    <form id="form" class="panel" autocomplete="off">
+      <fieldset>
+        <legend>Traffic and people</legend>
+        <div class="grid2">
+          <label>Requests per minute<input type="number" name="rpm" min="100" max="20000" step="100"></label>
+          <label>Replicas<input type="number" name="replicas" min="2" max="100" step="1"></label>
+          <label>Pod start time (min)<input type="number" name="podStartMin" min="1" max="10" step="1"></label>
+          <label>Alert to rollback (min)<input type="number" name="humanMin" min="0" max="60" step="1"></label>
+          <label>Page at error rate (%)<input type="number" name="alertErrorPct" min="0.5" max="20" step="0.5"></label>
+          <label>For (min)<input type="number" name="alertForMin" min="1" max="10" step="1"></label>
+          <label>Random seed<input type="number" name="seed" min="0" step="1"></label>
+        </div>
+        <p class="field-hint">The alert watches the whole service, not each version. It also pages when p99 is 25% over normal. A person then takes "alert to rollback" minutes to act.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Rolling update</legend>
+        <div class="grid2">
+          <label>maxSurge (%)<input type="number" name="surgePct" min="0" max="100" step="5"></label>
+          <label>maxUnavailable (%)<input type="number" name="unavailPct" min="0" max="100" step="5"></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Blue-green</legend>
+        <div class="grid2">
+          <label>Smoke test (min)<input type="number" name="previewMin" min="0" max="30" step="1"></label>
+          <label>Keep blue for (min)<input type="number" name="keepBlueMin" min="0" max="120" step="5"></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Canary</legend>
+        <div class="grid2">
+          <label>Steps (% of traffic)<input type="text" name="steps" inputmode="decimal"></label>
+          <label>Bake per step (min)<input type="number" name="bakeMin" min="1" max="30" step="1"></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Automated analysis</legend>
+        <div class="grid2">
+          <label>Significance level (%)<input type="number" name="alphaPct" min="0.1" max="10" step="0.1"></label>
+          <label>p99 tolerance (%)<input type="number" name="latTolPct" min="0" max="100" step="5"></label>
+        </div>
+        <p class="field-hint">At the end of each bake, a one-sided two-proportion z-test compares v2 errors with v1. It fails if the result is significant and v2 is at least 0.5 points worse. The p99 check fails if v2 is confidently more than the tolerance slower.</p>
+      </fieldset>
+      <p class="hint">Each minute, requests are split between versions, and errors and p99 are sampled from each version's true rates. Runs are reproducible from the seed.</p>
+    </form>
+
+    <section class="results">
+      <div class="tabs strategy-tabs" id="strategies" role="tablist" aria-label="Strategy"></div>
+      <p class="hint strategy-note" id="strategy-note"></p>
+      <div class="cards" id="cards"></div>
+
+      <div class="panel">
+        <div class="chart-head">
+          <h2>Traffic share by version</h2>
+          <ul class="legend">
+            <li><i class="swatch v1"></i>v1 (stable)</li>
+            <li><i class="swatch v2"></i>v2 (new)</li>
+            <li><i class="swatch outage"></i>No pods serving</li>
+          </ul>
+        </div>
+        <div class="chart-wrap"><svg id="c-share" class="chart" role="img" aria-label="Share of traffic on each version per minute"></svg><div class="tooltip" hidden></div></div>
+        <div class="chart-head second">
+          <h2>Error rate by version</h2>
+          <ul class="legend">
+            <li><i class="linekey v1"></i>v1</li>
+            <li><i class="linekey v2"></i>v2</li>
+            <li><i class="linekey dashed"></i>Alert threshold</li>
+          </ul>
+        </div>
+        <div class="chart-wrap"><svg id="c-errors" class="chart" role="img" aria-label="Error rate of each version per minute"></svg><div class="tooltip" hidden></div></div>
+        <ul class="legend markers">
+          <li><i class="mark m-step"></i>Step or switch</li>
+          <li><i class="mark m-pass"></i>Analysis passed</li>
+          <li><i class="mark m-bad"></i>Alert or analysis failed</li>
+          <li><i class="mark m-rollback"></i>Rollback</li>
+        </ul>
+        <p class="hint">Minutes are counted from the start of the rollout. The v2 line is hidden in minutes with fewer than 20 requests on v2.</p>
+      </div>
+
+      <div class="panel">
+        <h2>Timeline</h2>
+        <ol class="timeline" id="timeline"></ol>
+      </div>
+
+      <div class="panel">
+        <h2>All strategies, same release</h2>
+        <div class="table-scroll">
+          <table class="items">
+            <thead><tr>
+              <th>Strategy</th>
+              <th class="num" id="blast-head">Users hit</th>
+              <th class="num">Detected after</th>
+              <th class="num">Rollback took</th>
+              <th class="num">Healthy rollout</th>
+              <th class="num">Peak capacity</th>
+              <th class="num">Extra pod-hours</th>
+              <th class="num">Downtime</th>
+            </tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="note"></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">Runs entirely in your browser. Settings are stored in the page URL so you can share a scenario.</footer>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
